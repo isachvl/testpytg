@@ -1,0 +1,37 @@
+import sqlite3
+from datetime import datetime, timezone
+
+DB_PATH = "news.db"
+
+conn = sqlite3.connect(DB_PATH)
+cur = conn.cursor()
+
+# Возьмем последнюю новость из BBC, например source_id = 2
+cur.execute("""
+    SELECT id, title
+    FROM headlines
+    WHERE source_id = 2
+    ORDER BY id DESC
+    LIMIT 1
+""")
+row = cur.fetchone()
+
+if not row:
+    raise RuntimeError("Новостей для этого source_id нет")
+
+headline_id, title = row
+new_time = datetime.now(timezone.utc).isoformat()
+
+cur.execute("""
+    UPDATE headlines
+    SET fetched_at = ?
+    WHERE id = ?
+""", (new_time, headline_id))
+
+conn.commit()
+conn.close()
+
+print("Обновлена новость:")
+print("id =", headline_id)
+print("title =", title)
+print("new fetched_at =", new_time)

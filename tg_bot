@@ -1,0 +1,745 @@
+import asyncio
+import os
+import sqlite3
+from datetime import datetime, timezone
+from html import escape
+import sys
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_PATH = "news.db"
+DEFAULT_NEWS_LIMIT = 5
+
+PARSER_PATH = "parser.py"
+NEWSLETTER_INTERVAL_SECONDS = 30
+
+
+# =========================
+# DB
+# =========================
+
+def get_connection():
+    return sqlite3.connect(DB_PATH)
+
+
+def create_bot_tables():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_user_id INTEGER NOT NULL UNIQUE,
+            username TEXT,
+            first_name TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            source_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, source_id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (source_id) REFERENCES sources(id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS delivery_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            headline_id INTEGER NOT NULL,
+            sent_at TEXT NOT NULL,
+            UNIQUE(user_id, headline_id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (headline_id) REFERENCES headlines(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def ensure_user_by_tg_user(tg_user) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    if tg_user is None:
+        raise RuntimeError("Не удалось получить пользователя")
+
+    cur.execute("""
+        INSERT INTO users (telegram_user_id, username, first_name, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(telegram_user_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name
+    """, (
+        tg_user.id,
+        tg_user.username,
+        tg_user.first_name,
+        datetime.now(timezone.utc).isoformat()
+    ))
+
+    cur.execute(
+        "SELECT id FROM users WHERE telegram_user_id = ?",
+        (tg_user.id,)
+    )
+    row = cur.fetchone()
+    user_id = row[0]
+
+    conn.commit()
+    conn.close()
+    return user_id
+
+
+def ensure_user(message: Message) -> int:
+    return ensure_user_by_tg_user(message.from_user)
+
+
+def get_all_sources():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, code, name
+        FROM sources
+        ORDER BY name
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_source_by_id(source_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, code, name
+        FROM sources
+        WHERE id = ?
+    """, (source_id,))
+    row = cur.fetchone()
+
+    conn.close()
+    return row
+
+
+def get_latest_news(limit: int = DEFAULT_NEWS_LIMIT):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT s.name, h.title, h.url, h.domain, h.published_at, h.fetched_at
+        FROM headlines h
+        JOIN sources s ON s.id = h.source_id
+        ORDER BY COALESCE(h.published_at, h.fetched_at) DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_latest_news_by_source(source_id: int, limit: int = DEFAULT_NEWS_LIMIT):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT s.name, h.title, h.url, h.domain, h.published_at, h.fetched_at
+        FROM headlines h
+        JOIN sources s ON s.id = h.source_id
+        WHERE h.source_id = ?
+        ORDER BY COALESCE(h.published_at, h.fetched_at) DESC
+        LIMIT ?
+    """, (source_id, limit))
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def subscribe_all(user_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM sources")
+    source_ids = [row[0] for row in cur.fetchall()]
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    inserted = 0
+
+    for source_id in source_ids:
+        cur.execute("""
+            INSERT OR IGNORE INTO subscriptions (user_id, source_id, created_at)
+            VALUES (?, ?, ?)
+        """, (user_id, source_id, created_at))
+        if cur.rowcount > 0:
+            inserted += 1
+
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def subscribe_one(user_id: int, source_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR IGNORE INTO subscriptions (user_id, source_id, created_at)
+        VALUES (?, ?, ?)
+    """, (
+        user_id,
+        source_id,
+        datetime.now(timezone.utc).isoformat()
+    ))
+
+    inserted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def get_user_subscriptions(user_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT s.id, s.code, s.name
+        FROM subscriptions sub
+        JOIN sources s ON s.id = sub.source_id
+        WHERE sub.user_id = ?
+        ORDER BY s.name
+    """, (user_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def unsubscribe_all(user_id: int) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM subscriptions
+        WHERE user_id = ?
+    """, (user_id,))
+
+    deleted_count = cur.rowcount
+    conn.commit()
+    conn.close()
+    return deleted_count
+
+
+def unsubscribe_one(user_id: int, source_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM subscriptions
+        WHERE user_id = ? AND source_id = ?
+    """, (user_id, source_id))
+
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_all_subscriptions_for_newsletter():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT sub.user_id, u.telegram_user_id, sub.source_id, s.name
+        FROM subscriptions sub
+        JOIN users u ON u.id = sub.user_id
+        JOIN sources s ON s.id = sub.source_id
+        ORDER BY sub.user_id, sub.source_id
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_new_headlines_for_last_hour(user_id: int, source_id: int, limit: int = 5):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT h.id, h.title, h.url, h.domain
+        FROM headlines h
+        WHERE h.source_id = ?
+          AND datetime(replace(substr(h.fetched_at, 1, 19), 'T', ' ')) >= datetime('now', '-30 seconds')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM delivery_log dl
+              WHERE dl.user_id = ? AND dl.headline_id = h.id
+          )
+        ORDER BY COALESCE(h.published_at, h.fetched_at) DESC
+        LIMIT ?
+    """, (source_id, user_id, limit))
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def mark_as_sent(user_id: int, headline_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR IGNORE INTO delivery_log (user_id, headline_id, sent_at)
+        VALUES (?, ?, ?)
+    """, (
+        user_id,
+        headline_id,
+        datetime.now(timezone.utc).isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+# =========================
+# NEWSLETTER / PARSER
+# =========================
+
+async def run_parser():
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, PARSER_PATH,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if stdout:
+        print("[parser stdout]")
+        print(stdout.decode("utf-8", errors="ignore"))
+
+    if stderr:
+        print("[parser stderr]")
+        print(stderr.decode("utf-8", errors="ignore"))
+
+    return process.returncode == 0
+
+def format_newsletter_text(source_name: str, rows):
+    if not rows:
+        return None
+
+    lines = [f"<b>Новые новости: {escape(source_name)}</b>", ""]
+
+    for headline_id, title, url, domain in rows:
+        safe_title = escape(title)
+        safe_url = escape(url, quote=True)
+        safe_domain = escape(domain or "link")
+        lines.append(f"• {safe_title} — <a href=\"{safe_url}\">{safe_domain}</a>")
+
+    return "\n".join(lines)
+
+
+async def newsletter(bot: Bot):
+    while True:
+        print("Запуск parser.py...")
+        ok = await run_parser()
+
+        if ok:
+            subscriptions = get_all_subscriptions_for_newsletter()
+
+            for user_id, telegram_user_id, source_id, source_name in subscriptions:
+                rows = get_new_headlines_for_last_hour(user_id, source_id)
+
+                if not rows:
+                    continue
+
+                text = format_newsletter_text(source_name, rows)
+                if not text:
+                    continue
+
+                try:
+                    await bot.send_message(
+                        chat_id=telegram_user_id,
+                        text=text,
+                        disable_web_page_preview=True
+                    )
+
+                    for headline_id, _title, _url, _domain in rows:
+                        mark_as_sent(user_id, headline_id)
+
+                except Exception as e:
+                    print(f"Ошибка рассылки пользователю {telegram_user_id}: {e}")
+
+        print("Следующая проверка через 30 сек")
+        await asyncio.sleep(NEWSLETTER_INTERVAL_SECONDS)
+
+
+# =========================
+# KEYBOARDS
+# =========================
+
+def main_menu_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📰 Показать новости", callback_data="menu_news")
+    builder.button(text="➕ Подписаться на все", callback_data="sub_all")
+    builder.button(text="➕ Подписаться на выбранный", callback_data="choose_sub")
+    builder.button(text="📋 Мои подписки", callback_data="my_subs")
+    builder.button(text="➖ Отписаться от всех", callback_data="unsub_all")
+    builder.button(text="➖ Отписаться от выбранного", callback_data="choose_unsub")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def sources_keyboard(prefix: str):
+    builder = InlineKeyboardBuilder()
+    sources = get_all_sources()
+
+    for source_id, code, name in sources:
+        builder.button(
+            text=name,
+            callback_data=f"{prefix}:{source_id}"
+        )
+
+    builder.button(text="⬅️ Назад в меню", callback_data="back_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def unsubscribe_sources_keyboard(user_id: int):
+    builder = InlineKeyboardBuilder()
+    subs = get_user_subscriptions(user_id)
+
+    for source_id, code, name in subs:
+        builder.button(
+            text=name,
+            callback_data=f"unsub_one:{source_id}"
+        )
+
+    builder.button(text="⬅️ Назад в меню", callback_data="back_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+# =========================
+# FORMATTERS
+# =========================
+
+def format_news(rows):
+    if not rows:
+        return "В базе пока нет новостей."
+
+    lines = ["<b>Последние новости</b>", ""]
+    for source_name, title, url, domain, published_at, fetched_at in rows:
+        safe_title = escape(title)
+        safe_url = escape(url, quote=True)
+        safe_domain = escape(domain or "link")
+        safe_source = escape(source_name)
+
+        lines.append(
+            f"• <b>{safe_source}</b>: {safe_title} — "
+            f"<a href=\"{safe_url}\">{safe_domain}</a>"
+        )
+
+    return "\n".join(lines)
+
+
+def format_subscriptions(rows):
+    if not rows:
+        return "У тебя пока нет подписок."
+
+    lines = ["<b>Твои подписки</b>", ""]
+    for source_id, code, name in rows:
+        lines.append(f"• {escape(name)} (<code>{escape(code)}</code>)")
+
+    return "\n".join(lines)
+
+
+# =========================
+# BOT HANDLERS
+# =========================
+
+dp = Dispatcher()
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    ensure_user(message)
+
+    text = (
+        "<b>Новостной бот</b>\n\n"
+        "Выбери действие в меню:\n"
+        "• показать новости\n"
+        "• подписаться на все источники\n"
+        "• подписаться на выбранный источник\n"
+        "• посмотреть подписки\n"
+        "• отписаться от всех\n"
+        "• отписаться от выбранного источника"
+    )
+
+    await message.answer(text, reply_markup=main_menu_keyboard())
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    ensure_user(message)
+    await message.answer("Главное меню:", reply_markup=main_menu_keyboard())
+
+
+@dp.message(Command("news"))
+async def cmd_news(message: Message):
+    ensure_user(message)
+    rows = get_latest_news()
+    await message.answer(format_news(rows), disable_web_page_preview=True)
+
+
+@dp.message(Command("subscriptions"))
+async def cmd_subscriptions(message: Message):
+    user_id = ensure_user(message)
+    rows = get_user_subscriptions(user_id)
+    await message.answer(format_subscriptions(rows))
+
+
+@dp.message(Command("subscribe"))
+async def cmd_subscribe(message: Message):
+    ensure_user(message)
+
+    sources = get_all_sources()
+    if not sources:
+        await message.answer("Источники не найдены в базе.")
+        return
+
+    await message.answer(
+        "Выбери источник для подписки:",
+        reply_markup=sources_keyboard("sub_one")
+    )
+
+
+@dp.callback_query(F.data == "back_menu")
+async def back_menu(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        "Главное меню:",
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "choose_sub")
+async def menu_choose_sub(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        "Выбери источник, на который нужно подписаться:",
+        reply_markup=sources_keyboard("sub_one")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu_news")
+async def menu_news(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        "Выбери источник новостей:",
+        reply_markup=sources_keyboard("news_src")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "sub_all")
+async def menu_subscribe_all(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    user_id = ensure_user_by_tg_user(callback.from_user)
+    inserted = subscribe_all(user_id)
+
+    await callback.message.edit_text(
+        f"Подписка на все источники оформлена.\nДобавлено новых подписок: <b>{inserted}</b>",
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "my_subs")
+async def menu_my_subs(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    user_id = ensure_user_by_tg_user(callback.from_user)
+    rows = get_user_subscriptions(user_id)
+
+    await callback.message.edit_text(
+        format_subscriptions(rows),
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "unsub_all")
+async def menu_unsub_all(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    user_id = ensure_user_by_tg_user(callback.from_user)
+    deleted_count = unsubscribe_all(user_id)
+
+    await callback.message.edit_text(
+        f"Удалено подписок: <b>{deleted_count}</b>",
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "choose_unsub")
+async def menu_choose_unsub(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    user_id = ensure_user_by_tg_user(callback.from_user)
+    rows = get_user_subscriptions(user_id)
+
+    if not rows:
+        await callback.message.edit_text(
+            "У тебя нет подписок для удаления.",
+            reply_markup=main_menu_keyboard()
+        )
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        "Выбери источник, от которого нужно отписаться:",
+        reply_markup=unsubscribe_sources_keyboard(user_id)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("news_src:"))
+async def news_by_source(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    source_id = int(callback.data.split(":")[1])
+    source = get_source_by_id(source_id)
+
+    if not source:
+        await callback.answer("Источник не найден", show_alert=True)
+        return
+
+    rows = get_latest_news_by_source(source_id)
+    text = format_news(rows)
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=main_menu_keyboard(),
+        disable_web_page_preview=True
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("unsub_one:"))
+async def unsub_one_handler(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    user_id = ensure_user_by_tg_user(callback.from_user)
+    source_id = int(callback.data.split(":")[1])
+
+    source = get_source_by_id(source_id)
+    if not source:
+        await callback.answer("Источник не найден", show_alert=True)
+        return
+
+    ok = unsubscribe_one(user_id, source_id)
+    source_name = source[2]
+
+    if ok:
+        text = f"Подписка на <b>{escape(source_name)}</b> удалена."
+    else:
+        text = f"Подписка на <b>{escape(source_name)}</b> не найдена."
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sub_one:"))
+async def sub_one_handler(callback: CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    user_id = ensure_user_by_tg_user(callback.from_user)
+    source_id = int(callback.data.split(":")[1])
+
+    source = get_source_by_id(source_id)
+    if not source:
+        await callback.answer("Источник не найден", show_alert=True)
+        return
+
+    ok = subscribe_one(user_id, source_id)
+    source_name = source[2]
+
+    if ok:
+        text = f"Подписка на <b>{escape(source_name)}</b> добавлена."
+    else:
+        text = f"Ты уже подписан на <b>{escape(source_name)}</b>."
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("В .env не найден BOT_TOKEN")
+
+    create_bot_tables()
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+
+    asyncio.create_task(newsletter(bot))
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
